@@ -1,0 +1,96 @@
+%% P1 Identification (No Delay) – Based on Station Calibration
+clear; clc; close all;
+
+% -------- Files ----------
+files = ["data1_a.csv","data2_a.csv","data3_a.csv"];
+
+% -------- Station constants ----------
+U_OFFSET_V = 0.10;     % station input = setpoint_v - 0.10
+Y_OFFSET_V = 0.17;     % station output equiv = sensor_v + 0.17
+DIV_GAIN   = 3/2;
+
+CAL_A = 32.177;        % T = A*V + B
+CAL_B = -23.91;
+
+STEP_THRESH = 0.01;
+N_PREPEND_ZEROS = 10;
+
+% -------- System ID options ----------
+opt = procestOptions;
+opt.Focus = "simulation";
+opt.InitialCondition = "estimate";
+opt.Display = "off";
+
+G = cell(numel(files),1);
+
+fprintf("\n===== P1 IDENTIFICATION RESULTS =====\n");
+
+for k = 1:numel(files)
+
+    %% ---- Load data ----
+    tbl = readtable(fullfile(files(k)));
+
+    % Time
+    t = tbl.timestamp_ms / 1000;
+    t = t - t(1);
+    Ts = median(diff(t));
+
+    % Input (true station voltage)
+    u_cmd = tbl.setpoint_v;
+    u = u_cmd - U_OFFSET_V;
+
+    % Output (temperature)
+    v_station = (tbl.sensor_v + Y_OFFSET_V) * DIV_GAIN;
+    y = CAL_A * v_station + CAL_B;
+
+    %% ---- Step detection ----
+    stepIdx = find(abs([0; diff(u_cmd)]) > STEP_THRESH, 1, "first");
+    if isempty(stepIdx), stepIdx = 1; end
+
+    % Align step to t = 0
+    u_post = u(stepIdx:end);
+    y_post = y(stepIdx:end);
+
+    %% ---- Operating point ----
+    if stepIdx > 1
+        u0 = mean(u(1:stepIdx-1));
+        y0 = mean(y(1:stepIdx-1));
+    else
+        u0 = 0;
+        y0 = mean(y(1:round(2/Ts)));
+    end
+
+    %% ---- Deviation signals ----
+    du = u_post - u0;
+    dy = y_post - y0;
+
+    % Prepend zeros (important for procest)
+    du_id = [zeros(N_PREPEND_ZEROS,1); du];
+    dy_id = [zeros(N_PREPEND_ZEROS,1); dy];
+
+    z = iddata(dy_id, du_id, Ts);
+    z.TimeUnit = "s";
+
+    %% ---- P1 identification ----
+    sysP1 = procest(z, "P1", opt);
+
+    % Convert to tf: ΔT(s)/ΔV(s)
+    K  = sysP1.Kp;
+    Tp = sysP1.Tp1;
+    G{k} = tf(K, [Tp 1]);
+
+    %% ---- Fit ----
+    [~, fit] = compare(z, sysP1);
+
+    fprintf("\n%s\n", files(k));
+    fprintf("G%d(s) = %.6g / (%.6g s + 1)\n", k, K, Tp);
+    fprintf("Model fit: %.2f %%\n", fit);
+end
+
+% Final transfer functions
+G1 = G{1};
+G2 = G{2};
+G3 = G{3};
+
+disp(" "); disp("Final Identified Models:");
+disp(G1); disp(G2); disp(G3);

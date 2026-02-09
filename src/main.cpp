@@ -14,7 +14,7 @@ const int DAC_PIN = 25;  // DAC output (GPIO 25 or 26)
 // Setpoint configuration
 // Your module converts: 0V → 4mA, 3.3V → 20mA
 // Assuming station: 4mA → 0%, 20mA → 100% of temperature range
-const float SETPOINT_VOLTAGE = 1.5;  // Setpoint in volts (0 - 3.3V)
+const float SETPOINT_VOLTAGE = 2.1;  // Setpoint in volts (0 - 3.3V)
                                       // Adjust this to set your desired temperature
 
 // Timing

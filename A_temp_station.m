@@ -5,14 +5,15 @@ clear; clc; close all;
 
 % -------- Files ----------
 dataDir = "./data";
-files = ["data1.csv","data2.csv","data3.csv"];
+files = ["data1_a.csv","data2_a.csv","data3_a.csv"];
 
-% -------- Your constants ----------
-U_OFFSET_V = 0.17;     % station input = setpoint_v - 0.17
-Y_OFFSET_V = 0.15;     % station output equiv = sensor_v + 0.15 (sensor_v after divider)
-DIV_GAIN   = 3/2;      % V_station_out = (3/2)*V_afterDivider
-CAL_A = 36;            % T = 36*V - 24.315
-CAL_B = -24.315;
+% -------- NEW STATION constants (UPDATED) ----------
+U_OFFSET_V = 0.10;     % station input = setpoint_v - 0.10
+Y_OFFSET_V = 0.17;     % station output equiv = sensor_v + 0.17 (sensor_v after divider)
+DIV_GAIN   = 3/2;      % keep 3/2 if same divider; otherwise set to 1 if no divider
+
+CAL_A = 32.177;        % T = 32.177*V - 23.91
+CAL_B = -23.91;
 
 STEP_THRESH = 0.01;          % step detect threshold on setpoint_v
 INIT_SEC_IF_NO_PRESTEP = 2;  % for y0 if stepIdx==1
@@ -44,7 +45,7 @@ for k = 1:3
     u = u_cmd - U_OFFSET_V;
 
     % Output (temperature)
-    v_afterDiv = tbl.sensor_v;                          % after divider
+    v_afterDiv = tbl.sensor_v;                          % after divider (ADC-side)
     v_station  = (v_afterDiv + Y_OFFSET_V) * DIV_GAIN;  % true station output voltage
     y = CAL_A * v_station + CAL_B;                      % temperature (°C)
 
@@ -95,16 +96,16 @@ for k = 1:3
     fprintf("\n%s:\n", files(k));
     fprintf("G%d(s) = %.6g / (%.6g*s + 1)    | Fit = %.2f %%\n", k, K, Tconst, Fit(k));
 
-    % ---- FIX: create uniform time vector for step() ----
+    % Create uniform time vector for step()
     N = numel(tpost);
-    t_uniform = (0:Ts:Ts*(N-1)).';              % evenly spaced
-    y_uniform = interp1(tpost, ypost, t_uniform, "linear", "extrap"); % measured on uniform grid
+    t_uniform = (0:Ts:Ts*(N-1)).';              
+    y_uniform = interp1(tpost, ypost, t_uniform, "linear", "extrap");
 
     % Step response with actual input step magnitude
     [dT, tstep] = step(du_step(k) * G{k}, t_uniform);
     y_model_abs = y0 + dT;
 
-    % Plot (3 plots total)
+    % Plot
     figure(k);
     plot(t_uniform, y_uniform, "k", "LineWidth", 1.4); hold on;
     plot(tstep, y_model_abs, "--", "LineWidth", 1.4);

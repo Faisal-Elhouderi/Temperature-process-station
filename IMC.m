@@ -1,0 +1,36 @@
+%% IMC / Lambda Tuning for Temperature Process (PI Controller)
+
+clear; clc; close all;
+
+%% Nominal plant (Dataset 2)
+Kp_plant = 16.57;        % plant gain (°C/V)
+tau = 1459.68;           % time constant (s)
+
+G = tf(Kp_plant, [tau 1]);
+
+%% IMC tuning parameter (lambda)
+% Larger lambda  -> slower but more robust
+% Smaller lambda -> faster but less robust
+lambda = 800;           % try: 800, 1000, 1200
+
+%% IMC-PI controller formulas (FOPDT, no delay)
+Kp = tau / (Kp_plant * lambda);
+Ki = 1 / lambda;
+
+C_IMC = pid(Kp, Ki);
+
+%% Closed-loop system
+T_IMC = feedback(C_IMC * G, 1);
+
+%% Step response
+figure;
+step(T_IMC, 8000)   % long time because thermal system is slow
+grid on;
+title(['IMC / \lambda-Tuned PI Controller (\lambda = ' num2str(lambda) ')']);
+xlabel('Time (s)');
+ylabel('Temperature deviation (°C)');
+
+%% Display controller parameters
+fprintf('\nIMC / Lambda-Tuned PI Controller:\n');
+fprintf('Kp = %.6f\n', Kp);
+fprintf('Ki = %.6f\n', Ki);
