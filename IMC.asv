@@ -1,9 +1,9 @@
 %% IMC / Lambda Tuning for Temperature Process (PI Controller)
 
-%clear; clc; close all;
+clear; clc; close all;
 
 %% Nominal plant (Dataset 2)
-Kp_plant = 0.460407;        % plant gain (°C/V)
+Kp_plant = 0.46;        % plant gain (°C/V)
 tau = 1459.68;           % time constant (s)
 
 G = tf(Kp_plant, [tau 1]);

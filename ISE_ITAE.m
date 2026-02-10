@@ -3,7 +3,7 @@
 clear; clc; close all;
 
 %% Plant (nominal)
-Kp_plant = 16.57;
+Kp_plant = 0.460407;
 tau = 1459.68;
 G = tf(Kp_plant, [tau 1]);
 

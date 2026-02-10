@@ -4,13 +4,13 @@
 clear; clc; close all;
 
 %% ================= USER INPUT =================
-Kp = 0.110115;        % <-- put your desired Kp here
+Kp = 3.9;        % <-- put your desired Kp here
 Ki = 0.001250;      % <-- put your desired Ki here
 % ===============================================
 
 %% Identified plants
-G1 = tf(25.95, [1688.11 1]);    % Dataset 1
-G3 = tf(27.8,  [1508.15 1]);    % Dataset 3
+G1 = tf(0.648808, [1688.11 1]);    % Dataset 1
+G3 = tf(0.460407,  [1508.15 1]);    % Dataset 3
 
 %% PI Controller
 C = pid(Kp, Ki);
