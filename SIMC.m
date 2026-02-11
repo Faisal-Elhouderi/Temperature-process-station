@@ -1,6 +1,6 @@
 %% SIMC (Skogestad) PI Tuning
 
-clear; clc; close all;
+%clear; clc; close all;
 
 %% Plant
 Kp_plant = 0.460407;

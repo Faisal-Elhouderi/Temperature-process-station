@@ -1,25 +1,20 @@
-%% P1 (no delay) identification for 3 datasets - V/V (UPDATED with your offsets)
-% Output: Vout (station-side volts) / Input: u (station input volts)
+%% P1 (no delay) identification for 3 datasets - V/V version
+% Creates G1,G2,G3 as tf objects and plots measured output VOLTAGE vs model step response.
 
-clear; clc; close all;
+%clear; clc; close all;
 
 % -------- Files ----------
-dataDir = "./data";  % change to "." if CSVs are in same folder as this script
+dataDir = "./data";
 files = ["data1.csv","data2.csv","data3.csv"];
 
-% -------- Offsets / scaling (UPDATED) ----------
-U_OFFSET_V = 0.17;     % commanded -> station input: u = setpoint_v - 0.17
-Y_OFFSET_V = 0.15;     % station output reconstruction offset: Vstation ≈ sensor_v + 0.15 (before divider correction)
-DIV_GAIN   = 3/2;      % voltage divider correction (set to 1 if no divider)
+% -------- Station constants ----------
+U_OFFSET_V = 0.17;     % station input = setpoint_v - 0.10
+Y_OFFSET_V = 0.1;     % station output equiv = sensor_v + 0.17 (sensor_v after divider)
+DIV_GAIN   = 3/2;      % keep 3/2 if same divider; otherwise set to 1 if no divider
 
-% If a dataset doesn't contain a visible step (e.g., logging started after step),
-% assume pre-step commanded voltage was 0V:
-PRESTEP_CMD_V_ASSUMED = 0.0;
-
-% -------- Step detection / preprocessing ----------
-STEP_THRESH = 0.01;          % threshold to detect a jump in commanded setpoint_v
-INIT_SEC_IF_NO_PRESTEP = 2;  % estimate y0 from first seconds if no pre-step segment
-N_PREPEND_ZEROS = 10;        % helps procest initial transient warning
+STEP_THRESH = 0.01;          % step detect threshold on setpoint_v
+INIT_SEC_IF_NO_PRESTEP = 2;  % for y0 if stepIdx==1
+N_PREPEND_ZEROS = 10;        % for procest transient warning
 
 % -------- System ID options ----------
 opt = procestOptions;
@@ -27,13 +22,13 @@ opt.Focus = "simulation";
 opt.InitialCondition = "estimate";
 opt.Display = "off";
 
-G = cell(numel(files),1);
-Fit = zeros(numel(files),1);
-du_step = zeros(numel(files),1);
+G = cell(3,1);
+Fit = zeros(3,1);
+du_step = zeros(3,1);
 
 fprintf("\n=========== FINAL P1 TRANSFER FUNCTIONS (V/V, NO DELAY) ===========\n");
 
-for k = 1:numel(files)
+for k = 1:3
     fname = fullfile(dataDir, files(k));
     tbl = readtable(fname);
 
@@ -43,31 +38,28 @@ for k = 1:numel(files)
     Ts = median(diff(t));
 
     % Input (station input voltage)
-    u_cmd = tbl.setpoint_v;      % commanded voltage (what ESP32 outputs)
-    u = u_cmd - U_OFFSET_V;      % station input voltage (after input offset)
+    u_cmd = tbl.setpoint_v;
+    u = u_cmd - U_OFFSET_V;
 
-    % Output (station output voltage)  -> V/V output
-    v_adc = tbl.sensor_v;                         % ADC/monitor reading (after divider path)
-    y = (v_adc + Y_OFFSET_V) * DIV_GAIN;          % reconstructed station output voltage (V)
+    % Output (station output voltage)  <-- V/V OUTPUT HERE
+    v_afterDiv = tbl.sensor_v;                          % ADC-side voltage
+    y = (v_afterDiv + Y_OFFSET_V) * DIV_GAIN;           % station-side voltage (V)
 
-    % --- Detect step as a JUMP in commanded input ---
+    % Detect step in setpoint_v
     stepIdx = find(abs([0; diff(u_cmd)]) > STEP_THRESH, 1, "first");
     if isempty(stepIdx), stepIdx = 1; end
 
-    % Post-step data, aligned so "step time" is t=0
+    % Post-step data, aligned so step is at t=0
     tpost = t(stepIdx:end) - t(stepIdx);
     upost = u(stepIdx:end);
     ypost = y(stepIdx:end);
 
-    % Operating point (baseline)
+    % Operating point
     if stepIdx > 1
         u0 = mean(u(1:stepIdx-1));
         y0 = mean(y(1:stepIdx-1));
     else
-        % No visible step inside file -> assume command was 0V before logging
-        u0 = (PRESTEP_CMD_V_ASSUMED - U_OFFSET_V);
-
-        % Estimate y0 from first seconds (best available when no pre-step)
+        u0 = 0; % assumed pre-step input (same as your original code)
         N0 = min(numel(y), max(5, round(INIT_SEC_IF_NO_PRESTEP/Ts)));
         y0 = mean(y(1:N0));
     end
@@ -77,14 +69,13 @@ for k = 1:numel(files)
     u_ss = mean(upost(end-Nss+1:end));
     du_step(k) = u_ss - u0;
 
-    % Deviation signals for ID
+    % Deviation signals (for ID)
     du = upost - u0;
     dy = ypost - y0;
 
     % Prepend equilibrium zeros (helps procest)
     du_id = [zeros(N_PREPEND_ZEROS,1); du];
     dy_id = [zeros(N_PREPEND_ZEROS,1); dy];
-
     z = iddata(dy_id, du_id, Ts);
     z.TimeUnit = "s";
 
@@ -99,10 +90,9 @@ for k = 1:numel(files)
     G{k} = tf(K, [Tconst 1]);
 
     fprintf("\n%s:\n", files(k));
-    fprintf("G%d(s) = %.6g / (%.6g*s + 1)    | Fit = %.2f %% | Δu = %.3f V\n", ...
-        k, K, Tconst, Fit(k), du_step(k));
+    fprintf("G%d(s) = %.6g / (%.6g*s + 1)    | Fit = %.2f %%\n", k, K, Tconst, Fit(k));
 
-    % Create uniform time vector for plotting step response
+    % Create uniform time vector for step()
     N = numel(tpost);
     t_uniform = (0:Ts:Ts*(N-1)).';
     y_uniform = interp1(tpost, ypost, t_uniform, "linear", "extrap");
@@ -117,8 +107,8 @@ for k = 1:numel(files)
     plot(tstep, y_model_abs, "--", "LineWidth", 1.4);
     grid on;
     xlabel("Time (s)");
-    ylabel("Output Voltage (station, V)");
-    title(sprintf("%s | P1 (No Delay) | \\Delta u = %.3f V | Fit %.2f%%", files(k), du_step(k), Fit(k)));
+    ylabel("Output Voltage (V)");
+    title(sprintf("%s | P1 (No Delay) | \\Deltau = %.3f V | Fit %.2f%%", files(k), du_step(k), Fit(k)));
     legend("Measured Vout (resampled)", sprintf("Step of G%d(s)", k), "Location", "best");
 end
 

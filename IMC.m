@@ -9,7 +9,7 @@ tau      = 1459.68;    % time constant (s) (same)
 G = tf(Kp_plant, [tau 1]);
 %G = G2;
 % IMC tuning parameter
-lambda = 600;         % try 800, 1000, 1200
+lambda = 100;         % try 800, 1000, 1200
 
 % IMC-PI formulas (no delay)
 Kp = tau / (Kp_plant * lambda);

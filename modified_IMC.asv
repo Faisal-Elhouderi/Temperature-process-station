@@ -1,0 +1,127 @@
+%% IMC / Lambda Tuning for Voltage Plant (PI Controller)  [V/V]  -- Improved
+clear; clc; close all;
+
+% -------------------- Choose your plant --------------------
+% Option 1: Use your identified transfer function directly:
+% G = G2;
+
+% Option 2: If you only have K and tau (V/V):
+Kp_plant = 0.4604;     % MUST be V/V  (dcgain of your V/V plant)
+tau      = 1459.68;    % seconds
+G = tf(Kp_plant, [tau 1]);
+
+% -------------------- Extract K and tau robustly --------------------
+K = dcgain(G);                         % V/V gain
+p = pole(G);
+p = p(abs(p) > 1e-12);                 % avoid weird zeros
+tau_est = -1/real(p(1));               % for 1st-order stable pole
+if isfinite(tau_est) && tau_est > 0
+    tau = tau_est;
+end
+
+fprintf("Plant: K = %.6g (V/V), tau = %.3f s\n", K, tau);
+
+% -------------------- Tuning goals / constraints --------------------
+% Reference step in OUTPUT (volts). This is what step(T,...) assumes.
+r_step = 1.0;                 % 1 V step in output reference
+t_end  = max(8000, 8*tau);    % simulate long enough for slow thermal plant
+
+% If you want to limit actuator command u (station input volts), set limits:
+u_min = 0.0;      % station input min (V)   (change if your station input can go negative)
+u_max = 3.3;      % station input max (V)
+
+% -------------------- Lambda sweep (choose best automatically) --------------------
+% Rule of thumb for stable slow processes: lambda between ~0.2*tau and ~2*tau
+lambda_grid = logspace(log10(0.1*tau), log10(1.5*tau), 25);
+
+best = struct('J', inf, 'lambda', NaN, 'Kp', NaN, 'Ki', NaN, ...
+              'OS', NaN, 'Ts', NaN, 'Tr', NaN, 'u_peak', NaN);
+
+for lambda = lambda_grid
+
+    % IMC-PI (no delay)  --------- IMPORTANT FIX HERE ----------
+    Kp = tau / (K * lambda);
+    Ki = 1 / (K * lambda);            % <-- correct integral gain (Ki = Kp/tau)
+
+    C = pid(Kp, Ki);                  % PI: Kp + Ki/s
+
+    % Closed-loop transfer (output)
+    T = feedback(C*G, 1);
+
+    % Control signal transfer u/r = C*S where S = 1/(1+CG)
+    S = feedback(1, C*G);
+    U = minreal(C*S);
+
+    % Step responses
+    [y, t] = step(r_step*T, t_end);
+    [u, ~] = step(r_step*U, t_end);
+
+    % Performance numbers
+    info = stepinfo(y, t, y(end), 'SettlingTimeThreshold', 0.02);
+
+    OS = info.Overshoot;              % %
+    Ts = info.SettlingTime;           % s
+    Tr = info.RiseTime;               % s
+
+    u_peak = max(u);
+
+    % Tracking steady-state error (should be near zero for PI if not saturated)
+    ess = abs(r_step - y(end));
+
+    % Objective (you can adjust weights)
+    % - prefer smaller settling time
+    % - penalize overshoot > 5%
+    % - penalize control saturation beyond u_max (soft penalty)
+    J = Ts ...
+        + 5e3*max(0, OS-5)/100 ...                     % overshoot penalty
+        + 5e3*max(0, u_peak - u_max) ...              % saturation penalty
+        + 5e4*ess;                                     % steady-state error penalty
+
+    if J < best.J
+        best.J = J;
+        best.lambda = lambda;
+        best.Kp = Kp;
+        best.Ki = Ki;
+        best.OS = OS;
+        best.Ts = Ts;
+        best.Tr = Tr;
+        best.u_peak = u_peak;
+    end
+end
+
+% -------------------- Use the best lambda --------------------
+lambda = best.lambda;
+Kp = best.Kp;
+Ki = best.Ki;
+
+C_IMC = pid(Kp, Ki);
+T_IMC = feedback(C_IMC*G, 1);
+
+S = feedback(1, C_IMC*G);
+U_IMC = minreal(C_IMC*S);
+
+fprintf('\nBest IMC (V/V) found:\n');
+fprintf('lambda = %.3f s\n', lambda);
+fprintf('Kp     = %.6f\n', Kp);
+fprintf('Ki     = %.6f\n', Ki);
+fprintf('Overshoot = %.2f %%\n', best.OS);
+fprintf('RiseTime  = %.2f s\n', best.Tr);
+fprintf('Settling  = %.2f s\n', best.Ts);
+fprintf('u_peak    = %.3f V (station input)\n', best.u_peak);
+
+% -------------------- Plot output and control action --------------------
+figure;
+step(r_step*T_IMC, t_end);
+grid on;
+title(sprintf('IMC PI (V/V) | \\lambda=%.1f s | Kp=%.3g Ki=%.3g', lambda, Kp, Ki));
+xlabel('Time (s)');
+ylabel('Output voltage deviation (V)');
+
+figure;
+step(r_step*U_IMC, t_end);
+grid on;
+title('Control action u(t) for 1-V output reference step');
+xlabel('Time (s)');
+ylabel('Station input voltage u (V)');
+yline(u_max,'--','u_{max}');
+yline(u_min,'--','u_{min}');
