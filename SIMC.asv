@@ -8,7 +8,7 @@ tau = 1459.68;
 G = tf(Kp_plant, [tau 1]);
 
 %% SIMC tuning parameter
-tau_c = tau/7;   % closed-loop time constant (try tau/2, tau, 2*tau)
+tau_c = tau/8;   % cloed-loop time constant (try tau/2, tau, 2*tau)
 
 %% SIMC PI formulas (no dead time)
 Kp = tau / (Kp_plant * tau_c);
@@ -16,6 +16,7 @@ Ti = min(tau, 4*tau_c);
 Ki = Kp / Ti;
 
 C_SIMC = pid(Kp, Ki);
+
 %% Closed-loop response
 T_SIMC = feedback(C_SIMC * G, 1);
 
