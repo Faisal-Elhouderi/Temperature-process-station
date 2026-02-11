@@ -1,11 +1,11 @@
 %% PI Controller Validation on G1 and G3
 % User-defined Kp and Ki
 
-clear; clc; close all;
+%clear; clc; close all;
 
 %% ================= USER INPUT =================
-Kp = 3.9;        % <-- put your desired Kp here
-Ki = 0.001250;      % <-- put your desired Ki here
+%Kp = 3.1704;        % <-- put your desired Kp here
+%Ki = 0.001;      % <-- put your desired Ki here
 % ===============================================
 
 %% Identified plants

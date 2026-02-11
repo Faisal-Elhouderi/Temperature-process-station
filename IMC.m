@@ -1,36 +1,33 @@
-%% IMC / Lambda Tuning for Temperature Process (PI Controller)
+%% IMC / Lambda Tuning for Voltage Plant (PI Controller)  [V/V]
 
 %clear; clc; close all;
 
-%% Nominal plant (Dataset 2)
-Kp_plant = 0.460407;        % plant gain (°C/V)
-tau = 1459.68;           % time constant (s)
+% ---- Use the V/V model from your estimator (Dataset 2 for example)
+Kp_plant = 0.4604;    % <-- THIS MUST BE V/V (example only!)
+tau      = 1459.68;    % time constant (s) (same)
 
 G = tf(Kp_plant, [tau 1]);
+%G = G2;
+% IMC tuning parameter
+lambda = 1000;         % try 800, 1000, 1200
 
-%% IMC tuning parameter (lambda)
-% Larger lambda  -> slower but more robust
-% Smaller lambda -> faster but less robust
-lambda = 800;           % try: 800, 1000, 1200
-
-%% IMC-PI controller formulas (FOPDT, no delay)
+% IMC-PI formulas (no delay)
 Kp = tau / (Kp_plant * lambda);
 Ki = 1 / lambda;
 
 C_IMC = pid(Kp, Ki);
 
-%% Closed-loop system
+% Closed-loop
 T_IMC = feedback(C_IMC * G, 1);
 
-%% Step response
+% Step response (this is a 1-V reference step in output volts)
 figure;
-step(T_IMC, 8000)   % long time because thermal system is slow
+step(T_IMC, 8000)
 grid on;
-title(['IMC / \lambda-Tuned PI Controller (\lambda = ' num2str(lambda) ')']);
+title(['IMC / \lambda-Tuned PI (V/V)  \lambda = ' num2str(lambda)]);
 xlabel('Time (s)');
-ylabel('Temperature deviation (°C)');
+ylabel('Output voltage deviation (V)');
 
-%% Display controller parameters
-fprintf('\nIMC / Lambda-Tuned PI Controller:\n');
+fprintf('\nIMC / Lambda-Tuned PI Controller (V/V plant):\n');
 fprintf('Kp = %.6f\n', Kp);
 fprintf('Ki = %.6f\n', Ki);
