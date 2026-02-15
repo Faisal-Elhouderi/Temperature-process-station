@@ -1,128 +1,180 @@
-%% Closed-loop ID from PID log + comparison with open-loop model
+%% Identify "applied system" from PID log (NO offsets, NO divider)
+%  - Builds a synthetic reference step if ref_v is constant in the log
+%  - Identifies:
+%     (A) Closed-loop T(s): ref_v -> sensor_v_avg (2 poles, 0 zeros)
+%     (B) Plant-ish model Gp(s): u_v   -> sensor_v_avg (2 poles, 0 zeros) [optional]
+%  - Compares measured vs identified vs your open-loop G(s)
+
 %clear; clc; close all;
 
-% --------- File ----------
-fname = "data_PID/data_PID1.csv";   % adjust if needed (relative/absolute path)
+%% -------- File ----------
+dataDir  = "./data_PID";
+fileName = "data_PID1.csv";
+tbl = readtable(fullfile(dataDir, fileName));
 
-% --------- Known open-loop plant for comparison ----------
-G_open = tf(0.4604, [1458.68 1]);   % V/V (or whatever your G is defined in)
+%% -------- Signals (RAW, no offsets, no divider) ----------
+t = tbl.timestamp_ms/1000;  t = t - t(1);
 
-% --------- Read CSV ----------
-tbl = readtable(fname);
+r = tbl.ref_v;          % reference (V)
+y = tbl.sensor_v_avg;   % output (V)
 
-t = (tbl.timestamp_ms - tbl.timestamp_ms(1)) / 1000;   % seconds
-Ts = median(diff(t));                                   % sample time (s)
-
-r = tbl.ref_v;              % reference (input) in volts
-y = tbl.sensor_v_avg;       % measured output in volts
-u = tbl.u_v;                % controller output in volts
-sat = tbl.sat;              % saturation flag (0/1)
-
-fprintf("Loaded %d samples. Ts ≈ %.3f s\n", height(tbl), Ts);
-
-% --------- Plot raw signals ----------
-figure;
-plot(t, r, 'LineWidth', 1.4); hold on;
-plot(t, y, 'LineWidth', 1.4);
-grid on;
-xlabel('Time (s)');
-ylabel('Voltage (V)');
-title('Closed-loop response: reference vs measured output');
-legend('ref\_v (R)', 'sensor\_v\_avg (Y)', 'Location', 'best');
-
-figure;
-yyaxis left;
-plot(t, u, 'LineWidth', 1.4);
-ylabel('Control output u\_v (V)');
-yyaxis right;
-stairs(t, sat, 'LineWidth', 1.2);
-ylabel('sat flag');
-grid on;
-xlabel('Time (s)');
-title('Control effort and saturation');
-
-% --------- Find step start in reference (if it exists) ----------
-STEP_THRESH = 0.01;
-stepIdx = find(abs([0; diff(r)]) > STEP_THRESH, 1, "first");
-if isempty(stepIdx)
-    stepIdx = 1;
+hasU = ismember("u_v", string(tbl.Properties.VariableNames));
+if hasU
+    u = tbl.u_v;        % controller output (V)
 end
 
-% If there is no noticeable change in r, ID from r->y is not possible
-if stepIdx == 1 && (max(r) - min(r) < STEP_THRESH)
-    warning("ref_v does not change (no step). You cannot identify T(s)=Y/R from this file unless r varies.");
-    warning("If you want, you can instead identify plant-like dynamics using u_v -> sensor_v_avg.");
-end
-
-% --------- Build deviation data around the step (recommended) ----------
-t2 = t(stepIdx:end) - t(stepIdx);
-r2 = r(stepIdx:end);
-y2 = y(stepIdx:end);
-u2 = u(stepIdx:end);
-sat2 = sat(stepIdx:end);
-
-% Baselines (use a short window BEFORE the step if available)
-if stepIdx > 5
-    r0 = mean(r(1:stepIdx-1));
-    y0 = mean(y(1:stepIdx-1));
+% Optional: drop saturated samples
+useSatFilter = true;
+if useSatFilter && ismember("sat", string(tbl.Properties.VariableNames))
+    ok = (tbl.sat == 0);
 else
-    % if step is at start, estimate from first 2 seconds
-    N0 = min(numel(r), max(5, round(2/Ts)));
-    r0 = mean(r(1:N0));
-    y0 = mean(y(1:N0));
+    ok = true(height(tbl),1);
 end
 
-dr = r2 - r0;
-dy = y2 - y0;
+t = t(ok); r = r(ok); y = y(ok);
+if hasU, u = u(ok); end
 
-% Remove saturated samples from identification (important)
-idxGood = (sat2 == 0);
-dr_id = dr(idxGood);
-dy_id = dy(idxGood);
+%% -------- Resample to uniform Ts (recommended) ----------
+Ts = median(diff(t));
+t_uni = (0:Ts:t(end)).';
 
-% Create iddata (closed-loop I/O: R -> Y)
-z = iddata(dy_id, dr_id, Ts);
-z.TimeUnit = "s";
+r_uni = interp1(t, r, t_uni, "linear", "extrap");
+y_uni = interp1(t, y, t_uni, "linear", "extrap");
+if hasU
+    u_uni = interp1(t, u, t_uni, "linear", "extrap");
+end
 
-% --------- Identify T(s) as 2 poles, 0 zeros ----------
-np = 2; nz = 0;
+%% -------- Open-loop model for comparison ----------
+G = tf(0.4604, [1458.68 1]);
+
+%% ============================================================
+%  (A) Identify CLOSED-LOOP applied system: T(s) from ref -> y
+%      If ref is constant, we create a synthetic step by prepending
+%      a short pre-step segment of ref=0 and y=y(1).
+% ============================================================
+
+% Check if reference actually changes in the logged window
+refSpan = max(r_uni) - min(r_uni);
+REF_EPS = 1e-3;  % V
+
+N_PRE = 25;  % prepend samples to create a visible step for the estimator
+
+if refSpan < REF_EPS
+    fprintf("ref_v is ~constant in the log (span %.6f V). Creating synthetic pre-step.\n", refSpan);
+
+    % Assume the reference stepped from 0 -> r(1) at the start of logging
+    r_pre = zeros(N_PRE,1);
+    y_pre = y_uni(1)*ones(N_PRE,1);
+
+    r_id_abs = [r_pre; r_uni];
+    y_id_abs = [y_pre; y_uni];
+
+    % Use deviation form for ID (helps numerics, not "offset correction")
+    r0 = 0;                 % pre-step level
+    y0 = y_uni(1);          % initial output level
+    dr = r_id_abs - r0;
+    dy = y_id_abs - y0;
+
+    t_id = (0:Ts:Ts*(numel(dy)-1)).';
+    dr_step = r_uni(1) - 0; % step amplitude (≈1.7)
+else
+    % If ref has a real step inside the log, detect it and align
+    STEP_THRESH = 0.01;
+    stepIdx = find(abs([0; diff(r_uni)]) > STEP_THRESH, 1, "first");
+    if isempty(stepIdx), stepIdx = 1; end
+
+    tpost = t_uni(stepIdx:end) - t_uni(stepIdx);
+    rpost = r_uni(stepIdx:end);
+    ypost = y_uni(stepIdx:end);
+
+    if stepIdx > 1
+        r0 = mean(r_uni(1:stepIdx-1));
+        y0 = mean(y_uni(1:stepIdx-1));
+    else
+        r0 = r_uni(1);
+        y0 = y_uni(1);
+    end
+
+    dr = rpost - r0;
+    dy = ypost - y0;
+
+    t_id = tpost;
+
+    Nss = max(10, round(0.1*numel(rpost)));
+    dr_step = mean(rpost(end-Nss+1:end)) - r0;
+end
+
+zT = iddata(dy, dr, Ts);  zT.TimeUnit = "s";
+
 opt = tfestOptions;
+opt.Focus = "simulation";
+opt.InitialCondition = "estimate";
 opt.Display = "off";
-T_est = tfest(z, np, nz, opt);
 
-disp("Identified closed-loop T_est(s) = Y/R (2nd-order, no zeros):");
-disp(T_est);
+np = 2; nz = 0;
+That = tfest(zT, np, nz, opt);
+[~, fitT] = compare(zT, That);
 
-% --------- Compare measured vs model (time-domain) ----------
-% Simulate model output for the same input dr_id
-t_id = (0:Ts:Ts*(numel(dr_id)-1)).';
-yhat = lsim(T_est, dr_id, t_id);     % predicted deviation output
+fprintf("\n=== IDENTIFIED CLOSED-LOOP T(s): ref_v -> sensor_v_avg ===\n");
+disp(That);
+fprintf("Fit = %.2f %%\n", fitT);
 
-figure;
-plot(t_id, dy_id, 'k', 'LineWidth', 1.4); hold on;
-plot(t_id, yhat, '--', 'LineWidth', 1.4);
+% Simulate closed-loop model step (absolute output)
+[dY_T, t_T] = step(dr_step * That, t_id);
+yT_abs = y0 + dY_T;
+
+% Compare open-loop step (same amplitude, just for visual comparison)
+[dY_G, t_G] = step(dr_step * G, t_id);
+yG_abs = y0 + dY_G;
+
+%% ============================================================
+%  (B) (Optional but recommended) Identify "plant-ish" model: u -> y
+%      This often works better because u_v changes in your log.
+% ============================================================
+
+Gp = []; fitGp = NaN; yGp_abs = [];
+
+if hasU
+    % Use the whole resampled record (no need for ref step)
+    u0 = u_uni(1);
+    y0_u = y_uni(1);
+
+    du = u_uni - u0;
+    dy_u = y_uni - y0_u;
+
+    zP = iddata(dy_u, du, Ts);  zP.TimeUnit = "s";
+
+    Gp = tfest(zP, np, nz, opt);
+    [~, fitGp] = compare(zP, Gp);
+
+    fprintf("\n=== IDENTIFIED MODEL Gp(s): u_v -> sensor_v_avg ===\n");
+    disp(Gp);
+    fprintf("Fit = %.2f %%\n", fitGp);
+
+    % Simulate response of Gp to the measured u(t)
+    yGp_dev = lsim(Gp, du, t_uni);
+    yGp_abs = y0_u + yGp_dev;
+end
+
+%% -------- Plots ----------
+figure("Color","w","Name","Measured vs identified (closed-loop) vs open-loop");
+
+plot(t_id, (y0 + dy), "k", "LineWidth", 1.3); hold on;
+plot(t_T, yT_abs, "--", "LineWidth", 1.3);
+plot(t_G, yG_abs, ":", "LineWidth", 1.6);
 grid on;
-xlabel('Time (s)');
-ylabel('Output deviation (V)');
-title('Measured vs identified closed-loop response (deviation signals)');
-legend('Measured \Delta y', 'Model \Delta y (T\_est)', 'Location', 'best');
+xlabel("Time (s)");
+ylabel("sensor\_v\_avg (V)");
+title(sprintf("%s | step %.3f V | T(s) fit %.2f%%", fileName, dr_step, fitT));
+legend("Measured y", "Identified closed-loop T(s)", "Open-loop G(s) step", "Location","best");
 
-% --------- Step response comparison (open-loop vs closed-loop) ----------
-t_end = max(8000, 8*1458.68);  % long horizon for slow thermal dynamics
-
-figure;
-step(G_open, t_end); hold on;
-step(T_est, t_end);
-grid on;
-title('Step response comparison (unit step)');
-xlabel('Time (s)');
-ylabel('Output (V)');
-legend('Open-loop G(s)', 'Closed-loop T\_est(s)=Y/R', 'Location', 'best');
-
-% --------- Step metrics for the identified closed-loop T(s) ----------
-info = stepinfo(T_est);
-fprintf("\nClosed-loop identified T(s) step metrics (unit step):\n");
-fprintf("RiseTime: %.2f s\n", info.RiseTime);
-fprintf("SettlingTime (2%%): %.2f s\n", info.SettlingTime);
-fprintf("Overshoot: %.2f %%\n", info.Overshoot);
-fprintf("SteadyStateValue: %.4f\n", dcgain(T_est));
+if hasU
+    figure("Color","w","Name","Plant-ish identification using u_v -> y");
+    plot(t_uni, y_uni, "k", "LineWidth", 1.3); hold on;
+    plot(t_uni, yGp_abs, "--", "LineWidth", 1.3);
+    grid on;
+    xlabel("Time (s)");
+    ylabel("sensor\_v\_avg (V)");
+    title(sprintf("u_v -> y identification | Gp(s) fit %.2f%%", fitGp));
+    legend("Measured y", "Identified Gp(s) response to measured u_v(t)", "Location","best");
+end
