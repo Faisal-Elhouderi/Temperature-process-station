@@ -2,57 +2,65 @@
 #include <SPIFFS.h>
 
 // =========================================================
-//  ESP32 Temperature Station LQG Controller (LQG-Servo)
-//  - Same wiring + SPIFFS logging style as your previous I-PD code.
-//  - Uses your MATLAB-exported LQG parameters (lqg_params.mat).
+//  ESP32 Temperature Station Controller (LQG-Servo + SPIFFS Logging)
+//  ---------------------------------------------------------
+//  This is the "full" version matching your previous I-PD project style:
+//    - Same sampling scheme (0.5s), moving average buffer (last 10 samples)
+//    - Same SPIFFS logging workflow (data.csv + commands to print/clear/info)
+//    - Same pins (ADC=GPIO34, DAC=GPIO25) by default
 //
-//  Signals / units:
-//    ADC reads the DIVIDED sensor voltage (Vadc) ~ 0.67..3.3V
+//  Controller implemented: discrete-time LQG servo (Kalman estimator + LQI)
+//  Parameters are taken from your MATLAB export (lqg_params.mat).
+//
+//  IMPORTANT ABOUT UNITS:
+//    Your identified model is in TEMPERATURE units (ΔT / Δu), so the LQG
+//    tracks a temperature reference Tref (°C). The ADC voltage is converted
+//    to temperature using the same formula as MATLAB.
+//
+//  Measurement path:
+//    ADC reads divided sensor voltage Vadc (≈0.67..3.3V)
 //    Temperature conversion (match MATLAB):
 //      T = TEMP_A * ( G_div * (Vadc + V_SENSOR_OFFSET) ) + TEMP_B
 //
-//    Controller computes station-input command u_station in volts (1..5V),
-//    then maps it to DAC voltage u_dac (0..3.3V) via your amplifier mapping:
-//      u_station = 1 + (4/3.3) * u_dac
+//  Actuator path:
+//    We compute station input command u_station (1..5V), then map to DAC (0..3.3V)
+//    assuming your amplifier mapping is linear:
+//      u_station = 1 + (4/3.3)*u_dac
 //      u_dac     = (u_station - 1) / (4/3.3)
 //
-//  Control structure (deviation model around bias):
-//    dT_meas = T_meas - T0
+//  Deviation-model control around a bias:
+//    dT_meas = T_meas - T_baseC
 //    xhat[k+1] = A*xhat + B*du + L*(dT_meas - (C*xhat + D*du))
 //    du_unsat  = -Kx*xhat - Ki*xi
-//    u_station_unsat = U_STATION_BIAS + du_unsat  (clamped 1..5V)
-//    du_cmd = u_station_cmd - U_STATION_BIAS
+//    u_station_unsat = U_station_bias + du_unsat
+//    u_station_cmd = sat(u_station_unsat, 1..5)
+//    du_cmd = u_station_cmd - U_station_bias
 //    xi[k+1] = xi[k] + Ts*( e + (du_cmd - du_unsat)/Taw )   (anti-windup)
 //
-//  Serial commands (single char like your old code):
+//  Serial commands (same style as your I-PD):
 //    'e' : Enable/disable LQG control (bumpless init)
 //    'r' : Reset states, disable control, output = bias
-//    '+' : Increase temperature reference by +0.5 C
-//    '-' : Decrease temperature reference by -0.5 C
+//    '+' : Increase Tref by +0.5 °C
+//    '-' : Decrease Tref by -0.5 °C
 //    's' : Toggle logging to SPIFFS
 //    'p' : Print file contents
 //    'c' : Clear data file
 //    'i' : File info
 //    'v' : Print current values
 //    'h' : Help
-//
-//  IMPORTANT:
-//    - This code assumes you are using ESP32 DAC on GPIO25 or GPIO26.
-//    - If your "setpoint_v" in your CSV is ESP32-side (0..3.3V) not station-side,
-//      the bias U_STATION_BIAS you exported may be off. You can edit it below.
 // =========================================================
 
 
 // ==================== CONFIGURATION ====================
 
-// Base sampling interval for ADC reads / control / logging (ms)
+// Base sampling interval for ADC reads / logging (ms)
 const unsigned long SAMPLE_INTERVAL_MS = 500;   // from MATLAB Ts
 
-// Moving average window length (same idea as your old code)
+// Moving average window length (last 10 samples, spaced by SAMPLE_INTERVAL_MS)
 const int AVG_WINDOW = 10;
 
-// Control update rate (1 = every sample)
-const int CTRL_UPDATE_EVERY_N_SAMPLES = 1;
+// LQG update rate:
+const int LQG_UPDATE_EVERY_N_SAMPLES = 1;
 
 // ADC input pin (sensor voltage AFTER divider)
 const int ADC_PIN = 34;
@@ -60,56 +68,57 @@ const int ADC_PIN = 34;
 // DAC output pin (setpoint output)
 const int DAC_PIN = 25;
 
-// ADC conversion (ESP32 defaults to 12-bit)
-const int ADC_MAX_COUNTS = 4095;
-const float ADC_VREF = 3.3f;  // approx; calibrate if needed
+// DAC output voltage limits (ESP32 side)
+const float U_DAC_MIN_V = 0.0f;
+const float U_DAC_MAX_V = 3.3f;
 
-// Clamp plausible ADC voltage range (post divider)
-const float V_ADC_MIN = 0.67f;
-const float V_ADC_MAX = 3.30f;
+// ---------------- Station actuator limits (after amplifier) ----------------
+const float U_STATION_MIN_V = 1.0f;
+const float U_STATION_MAX_V = 5.0f;
 
-// Station input limits (after your amplifier)
-const float U_STATION_MIN = 1f;
-const float U_STATION_MAX = 5f;
-
-// DAC limits (ESP32 side)
-const float U_DAC_MIN = 0f;
-const float U_DAC_MAX = 3.3f;
-
-// Amplifier mapping (assumed linear): u_station = 1 + (4/3.3)*u_dac
-const float GAIN_DAC2STATION = (U_STATION_MAX - U_STATION_MIN) / (U_DAC_MAX - U_DAC_MIN); // 4/3.3
-const float OFFS_DAC2STATION = U_STATION_MIN;
+// Amplifier mapping (assumed linear):
+//   u_station = U_STATION_MIN + ( (U_STATION_MAX-U_STATION_MIN) / 3.3 ) * u_dac
+const float GAIN_DAC2STATION = (U_STATION_MAX_V - U_STATION_MIN_V) / (U_DAC_MAX_V - U_DAC_MIN_V); // 4/3.3
+const float OFFS_DAC2STATION = U_STATION_MIN_V;
 
 // Operating point bias (station input volts) from MATLAB export
 float U_station_bias = 1.05f;
 
-// Temperature conversion constants (from MATLAB export)
-const float TEMP_A = 36f;
+// ---------------- Measurement clamp (ADC node volts) ----------------
+const float V_ADC_MIN = 0.67f;
+const float V_ADC_MAX = 3.30f;
+
+// ---------------- Temperature conversion constants (match MATLAB) ----------------
+// T = TEMP_A * ( G_div * (Vadc + V_SENSOR_OFFSET) ) + TEMP_B
+const float TEMP_A = 36.0f;
 const float TEMP_B = -24.315f;
 const float G_div  = 1.5f;
 const float V_SENSOR_OFFSET = 0.15f;
 
-// LQG parameters (from MATLAB export) - nx=1
+// (Optional) identification offset used in MATLAB (not needed directly in deviation form)
+const float U_OFFSET_V = 0.1f;
+
+// ---------------- LQG parameters (from MATLAB export) ----------------
+// nx = 1
 const float A = 0.9996456815f;
 const float B = 0.06248892689f;
 const float C = 0.09839974458f;
-const float D = 0f;
+const float D = 0.0f;
 
 const float Kx = 1.491179127f;
 const float Ki = -1.358196596f;
 const float L  = 0.04885791904f;
 
-// Integrator robustness
+// ---------------- Practical knobs ----------------
 const float ERROR_DEADBAND_C = 0.05f;
-const float Taw = 60.0f;             // anti-windup time constant (s)
+const float Taw = 60.0f; // anti-windup back-calculation time constant (seconds)
 
-// Optional station-command rate limit (helps TRIAC / avoids jerk)
+// Optional station-command rate limit (helps TRIAC / reduces jerk)
 const bool  USE_RATE_LIMIT = true;
 const float RATE_LIMIT_V_PER_S = 0.30f; // station V/s
-float duRateMaxPerStep = 0.0f;
 
 // Reference adjust step
-const float TREF_STEP_C = 0.5f;
+const float TREF_STEP_C = 75.58f;
 
 // ---------------- Logging ----------------
 const char* DATA_FILE = "/data.csv";
@@ -133,14 +142,17 @@ float xhat = 0.0f;
 float xi   = 0.0f;
 float du   = 0.0f;  // deviation command in station volts
 
-// Baseline temperature (updated when enabling for bumpless behavior)
-float T0 = 25.3434f;
+// Baseline temperature (renamed to avoid ESP32 core symbol conflict with T0)
+float T_baseC = 25.3434f;
 
 // Reference temperature (C)
 float TrefC = 25.3434f;
 
 // Current DAC output voltage (ESP32 side)
 float uDacV = 0.0f;
+
+// Rate limit per control step
+float duRateMaxPerStep = 0.0f;
 
 
 // ==================== HELPERS ====================
@@ -150,11 +162,11 @@ static inline float clampf(float x, float lo, float hi) {
   return x;
 }
 
-float adcCountsToVoltage(int adcValue) {
-  return (adcValue / (float)ADC_MAX_COUNTS) * ADC_VREF;
+float adcToVoltage(int adcValue) {
+  // ESP32 ADC: 12-bit (0-4095), ~3.3V reference
+  return (adcValue / 4095.0f) * 3.3f;
 }
 
-// Moving average update: read ADC once, update buffer, return average ADC-node voltage (Vadc)
 float readAdcVoltageAveraged() {
   int raw = analogRead(ADC_PIN);
 
@@ -175,39 +187,37 @@ float readAdcVoltageAveraged() {
   }
 
   int denom = adcFilled ? AVG_WINDOW : max(1, adcIdx);
-  float avgAdcCounts = (float)adcSum / (float)denom;
-  float vAdc = adcCountsToVoltage((int)(avgAdcCounts + 0.5f));
+  float avgAdc = (float)adcSum / (float)denom;
+  float vAdc = adcToVoltage((int)(avgAdc + 0.5f));
 
   // clamp to plausible sensor range
   vAdc = clampf(vAdc, V_ADC_MIN, V_ADC_MAX);
   return vAdc;
 }
 
-// Temperature conversion (match MATLAB)
 float adcToTempC(float vAdc) {
   return TEMP_A * (G_div * (vAdc + V_SENSOR_OFFSET)) + TEMP_B;
 }
 
-// Compute "equivalent station sensor voltage" before divider/offset (useful to log)
+// Useful to log: the "station-equivalent" voltage before divider/offset used in MATLAB
 float adcToStationEquivalentV(float vAdc) {
   return G_div * (vAdc + V_SENSOR_OFFSET);
 }
 
-// Set DAC output voltage (ESP32 side 0..3.3V)
-void setDacVoltage(float vDac) {
-  vDac = clampf(vDac, U_DAC_MIN, U_DAC_MAX);
-  uDacV = vDac;
+void setDacVoltage(float voltage) {
+  voltage = clampf(voltage, U_DAC_MIN_V, U_DAC_MAX_V);
+  uDacV = voltage;
 
   // ESP32 DAC: 8-bit (0-255) for ~0-3.3V
-  int dacValue = (int)((vDac / U_DAC_MAX) * 255.0f + 0.5f);
+  int dacValue = (int)((voltage / 3.3f) * 255.0f + 0.5f);
   dacWrite(DAC_PIN, dacValue);
 }
 
-// Convert station command (1..5V) to DAC voltage (0..3.3V)
 float stationToDacV(float uStation) {
   // u_station = OFFS + GAIN*u_dac  => u_dac = (u_station - OFFS)/GAIN
   return (uStation - OFFS_DAC2STATION) / GAIN_DAC2STATION;
 }
+
 
 // ==================== SPIFFS / LOGGING ====================
 void initSPIFFS() {
@@ -310,7 +320,7 @@ bool logLqgRow(unsigned long timestampMs,
 // ==================== LQG CONTROL ====================
 void initLqgBumpless(float TmeasNow) {
   // Reset deviation model around current temperature
-  T0 = TmeasNow;
+  T_baseC = TmeasNow;
   TrefC = TmeasNow;
 
   xhat = 0.0f;
@@ -318,18 +328,17 @@ void initLqgBumpless(float TmeasNow) {
   du   = 0.0f;
 
   // Output bias
-  float uStation = clampf(U_station_bias, U_STATION_MIN, U_STATION_MAX);
+  float uStation = clampf(U_station_bias, U_STATION_MIN_V, U_STATION_MAX_V);
   float uDac = stationToDacV(uStation);
   setDacVoltage(uDac);
 }
 
 float lqgStep(float Tref, float Tmeas, float TsCtrl,
-              float vAdcAvg,
               float& That,
               float& uStationCmd,
               int& satFlag) {
   // deviation measurement
-  float dT_meas = Tmeas - T0;
+  float dT_meas = Tmeas - T_baseC;
 
   // observer
   float yhat = C * xhat + D * du;
@@ -337,7 +346,7 @@ float lqgStep(float Tref, float Tmeas, float TsCtrl,
 
   // estimate
   float dT_hat = C * xhat + D * du;
-  That = T0 + dT_hat;
+  That = T_baseC + dT_hat;
 
   // error (integrate on estimate)
   float e = Tref - That;
@@ -348,7 +357,7 @@ float lqgStep(float Tref, float Tmeas, float TsCtrl,
 
   // absolute station command and saturation
   float u_unsat = U_station_bias + du_unsat;
-  float u_sat = clampf(u_unsat, U_STATION_MIN, U_STATION_MAX);
+  float u_sat = clampf(u_unsat, U_STATION_MIN_V, U_STATION_MAX_V);
   satFlag = (u_sat != u_unsat) ? 1 : 0;
 
   float du_sat = u_sat - U_station_bias;
@@ -360,7 +369,7 @@ float lqgStep(float Tref, float Tmeas, float TsCtrl,
     ddu = clampf(ddu, -duRateMaxPerStep, duRateMaxPerStep);
     du_cmd = du + ddu;
     // recompute u from rate-limited du
-    u_sat = clampf(U_station_bias + du_cmd, U_STATION_MIN, U_STATION_MAX);
+    u_sat = clampf(U_station_bias + du_cmd, U_STATION_MIN_V, U_STATION_MAX_V);
   }
 
   // anti-windup back-calculation
@@ -378,9 +387,9 @@ void printHelp() {
   Serial.println("\n----------------------------------------");
   Serial.println("Commands:");
   Serial.println("  'e' - Enable/Disable LQG control (bumpless)");
-  Serial.println("  'r' - Reset (disable control, output=bias, reset states)");
-  Serial.println("  '+' - Increase temperature reference by 0.5 C");
-  Serial.println("  '-' - Decrease temperature reference by 0.5 C");
+  Serial.println("  'r' - Reset (disable LQG, output=bias, reset states)");
+  Serial.println("  '+' - Increase Tref by 0.5 C");
+  Serial.println("  '-' - Decrease Tref by 0.5 C");
   Serial.println("  's' - Toggle logging to SPIFFS");
   Serial.println("  'p' - Print file contents");
   Serial.println("  'c' - Clear data file");
@@ -396,27 +405,38 @@ void printCurrentValues() {
   float vStEq = adcToStationEquivalentV(vAdc);
 
   Serial.printf("\nLQG: %s | Logging: %s\n", lqgEnabled ? "ON" : "OFF", loggingEnabled ? "ON" : "OFF");
-  Serial.printf("Tref:       %.3f C\n", TrefC);
-  Serial.printf("Tmeas:      %.3f C\n", tMeas);
-  Serial.printf("T0:         %.3f C (baseline)\n", T0);
-  Serial.printf("VadcAvg:    %.4f V\n", vAdc);
-  Serial.printf("VstationEq: %.4f V\n", vStEq);
-  Serial.printf("Bias u_st:  %.4f V (station)\n", U_station_bias);
-  Serial.printf("uDacV:      %.4f V (DAC)\n", uDacV);
-  Serial.printf("xhat:       %.6f\n", xhat);
-  Serial.printf("xi:         %.6f\n", xi);
-  Serial.printf("du:         %.6f (station V deviation)\n\n", du);
+  Serial.printf("TrefC:        %.3f C\n", TrefC);
+  Serial.printf("Tmeas:        %.3f C\n", tMeas);
+  Serial.printf("T_baseC:      %.3f C (baseline)\n", T_baseC);
+  Serial.printf("VadcAvg:      %.4f V\n", vAdc);
+  Serial.printf("VstationEq:   %.4f V\n", vStEq);
+  Serial.printf("Bias u_station=%.4f V (station)\n", U_station_bias);
+  Serial.printf("uDacV:        %.4f V (DAC)\n", uDacV);
+  Serial.printf("xhat:         %.6f\n", xhat);
+  Serial.printf("xi:           %.6f\n", xi);
+  Serial.printf("du:           %.6f (station V deviation)\n\n", du);
 }
 
 
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  while (!Serial) { delay(10); }
+
+  Serial.println("\n========================================");
+  Serial.println("   ESP32 Temperature Station LQG (LQG-Servo)");
+  Serial.println("   SPIFFS logging compatible with your I-PD project");
+  Serial.println("========================================");
 
   initSPIFFS();
 
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   pinMode(ADC_PIN, INPUT);
+
+  // Start output at bias
+  float uStation0 = clampf(U_station_bias, U_STATION_MIN_V, U_STATION_MAX_V);
+  setDacVoltage(stationToDacV(uStation0));
 
   // Prime the moving average
   for (int k = 0; k < AVG_WINDOW; k++) {
@@ -424,11 +444,11 @@ void setup() {
     readAdcVoltageAveraged();
   }
 
-  // Rate limit per step based on Ts
-  float TsCtrl = (CTRL_UPDATE_EVERY_N_SAMPLES * SAMPLE_INTERVAL_MS) / 1000.0f;
+  // Rate limit per step based on control period
+  float TsCtrl = (LQG_UPDATE_EVERY_N_SAMPLES * SAMPLE_INTERVAL_MS) / 1000.0f;
   duRateMaxPerStep = RATE_LIMIT_V_PER_S * TsCtrl;
 
-  // Initial baseline + output bias
+  // Bumpless init around current measurement
   float vAdc0 = readAdcVoltageAveraged();
   float tMeas0 = adcToTempC(vAdc0);
   initLqgBumpless(tMeas0);
@@ -439,17 +459,17 @@ void setup() {
   Serial.printf("  Sample interval: %lu ms\n", SAMPLE_INTERVAL_MS);
   Serial.printf("  Avg window: %d samples (%.1f s)\n",
                 AVG_WINDOW, (AVG_WINDOW * SAMPLE_INTERVAL_MS) / 1000.0f);
-  Serial.printf("  Control update every: %d samples (Ts_ctrl = %.3f s)\n",
-                CTRL_UPDATE_EVERY_N_SAMPLES, TsCtrl);
+  Serial.printf("  LQG update every: %d samples (Ts_ctrl = %.3f s)\n",
+                LQG_UPDATE_EVERY_N_SAMPLES, TsCtrl);
 
   Serial.printf("\nLQG params (nx=1):\n");
   Serial.printf("  A=%.9f B=%.9f C=%.9f D=%.9f\n", A, B, C, D);
   Serial.printf("  Kx=%.6f Ki=%.6f L=%.6f\n", Kx, Ki, L);
-  Serial.printf("  Bias u_station=%.4f V (limits %.1f..%.1f V)\n", U_station_bias, U_STATION_MIN, U_STATION_MAX);
+  Serial.printf("  Bias u_station=%.4f V (limits %.1f..%.1f V)\n", U_station_bias, U_STATION_MIN_V, U_STATION_MAX_V);
 
   Serial.printf("\nTemp conversion:\n");
   Serial.printf("  T = %.3f*(%.3f*(Vadc + %.3f)) + %.3f\n", TEMP_A, G_div, V_SENSOR_OFFSET, TEMP_B);
-  Serial.printf("  Initial T0=%.3f C\n", T0);
+  Serial.printf("  Initial T_baseC=%.3f C\n", T_baseC);
 
   printHelp();
   printFileInfo();
@@ -473,7 +493,7 @@ void loop() {
 
         if (lqgEnabled) {
           initLqgBumpless(tMeasNow);
-          Serial.println("LQG ENABLED (bumpless: T0=Tmeas, xhat/xi/du reset, output=bias)");
+          Serial.println("LQG ENABLED (bumpless: T_baseC=Tmeas, xhat/xi/du reset, output=bias)");
         } else {
           Serial.println("LQG DISABLED (output holds last DAC value)");
         }
@@ -546,20 +566,20 @@ void loop() {
     float vStationEq = adcToStationEquivalentV(vAdcAvg);
 
     // Update LQG at configured rate
-    if (lqgEnabled && (sampleCount % CTRL_UPDATE_EVERY_N_SAMPLES == 0)) {
-      float TsCtrl = (CTRL_UPDATE_EVERY_N_SAMPLES * SAMPLE_INTERVAL_MS) / 1000.0f;
+    if (lqgEnabled && (sampleCount % LQG_UPDATE_EVERY_N_SAMPLES == 0)) {
+      float TsCtrl = (LQG_UPDATE_EVERY_N_SAMPLES * SAMPLE_INTERVAL_MS) / 1000.0f;
 
       float That = tMeas;
       float uStationCmd = U_station_bias;
       int sat = 0;
 
-      float duCmd = lqgStep(TrefC, tMeas, TsCtrl, vAdcAvg, That, uStationCmd, sat);
+      float duCmd = lqgStep(TrefC, tMeas, TsCtrl, That, uStationCmd, sat);
 
       // Output
       float uDac = stationToDacV(uStationCmd);
       setDacVoltage(uDac);
 
-      // Logging
+      // Logging (only when LQG updates)
       if (loggingEnabled) {
         logLqgRow(now, TrefC, tMeas, That,
                   vAdcAvg, vStationEq,
@@ -568,9 +588,9 @@ void loop() {
       }
 
       // Serial print every few updates
-      static unsigned long ctrlPrintCount = 0;
-      ctrlPrintCount++;
-      if (ctrlPrintCount % 5 == 0) {
+      static unsigned long lqgPrintCount = 0;
+      lqgPrintCount++;
+      if (lqgPrintCount % 5 == 0) {
         Serial.printf("t=%lu ms | Tref=%.2f T=%.2f That=%.2f | Vadc=%.3f | u_st=%.3f u_dac=%.3f | xhat=%.4f xi=%.4f %s\n",
                       now, TrefC, tMeas, That, vAdcAvg, uStationCmd, uDac, xhat, xi, sat ? "(SAT)" : "");
       }
