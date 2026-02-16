@@ -11,7 +11,7 @@ clear; clc; close all;
 
 % -------- Files ----------
 dataDir = "./data";
-files = ["data1.csv","data2.csv","data3.csv"];
+files = ["data1_a.csv","data2_a.csv","data3_a.csv"];
 
 % -------- Station constants (from your report) ----------
 U_OFFSET_V = 0.10;    % input offset (station input = setpoint_v - 0.10 V)
@@ -128,7 +128,7 @@ for k = 1:3
 
     % Absolute prediction: y_hat = y0 + ΔT_model
     y_model_abs = y0 + dT_model;
-
+%{
     figure(k);
     plot(t_uniform, y_uniform, "k", "LineWidth", 1.4); hold on;
     plot(tstep, y_model_abs, "--", "LineWidth", 1.4);
@@ -138,6 +138,8 @@ for k = 1:3
     title(sprintf("%s | P1 (No Delay) | u0=0, y0=first sample | \\Deltau=%.3f V | Fit %.2f%%", ...
                   files(k), du_step(k), Fit(k)));
     legend("Measured Temperature (resampled)", sprintf("Model: y0 + step(\\Deltau*G%d)", k), "Location", "best");
+%}
+    
 end
 
 % Final tf objects

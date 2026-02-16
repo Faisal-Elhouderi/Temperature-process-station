@@ -49,7 +49,7 @@
 const unsigned long SAMPLE_INTERVAL_MS = 500;   // from MATLAB Ts
 
 // Moving average window length (same idea as your old code)
-const int AVG_WINDOW = 4;
+const int AVG_WINDOW = 10;
 
 // Control update rate (1 = every sample)
 const int CTRL_UPDATE_EVERY_N_SAMPLES = 1;
@@ -69,11 +69,11 @@ const float V_ADC_MIN = 0.67f;
 const float V_ADC_MAX = 3.30f;
 
 // Station input limits (after your amplifier)
-const float U_STATION_MIN = 1.0f;
-const float U_STATION_MAX = 5.0f;
+const float U_STATION_MIN = 1f;
+const float U_STATION_MAX = 5f;
 
 // DAC limits (ESP32 side)
-const float U_DAC_MIN = 0.0f;
+const float U_DAC_MIN = 0f;
 const float U_DAC_MAX = 3.3f;
 
 // Amplifier mapping (assumed linear): u_station = 1 + (4/3.3)*u_dac
@@ -84,7 +84,7 @@ const float OFFS_DAC2STATION = U_STATION_MIN;
 float U_station_bias = 1.05f;
 
 // Temperature conversion constants (from MATLAB export)
-const float TEMP_A = 36.0f;
+const float TEMP_A = 36f;
 const float TEMP_B = -24.315f;
 const float G_div  = 1.5f;
 const float V_SENSOR_OFFSET = 0.15f;
@@ -93,7 +93,7 @@ const float V_SENSOR_OFFSET = 0.15f;
 const float A = 0.9996456815f;
 const float B = 0.06248892689f;
 const float C = 0.09839974458f;
-const float D = 0.0f;
+const float D = 0f;
 
 const float Kx = 1.491179127f;
 const float Ki = -1.358196596f;
@@ -109,7 +109,7 @@ const float RATE_LIMIT_V_PER_S = 0.30f; // station V/s
 float duRateMaxPerStep = 0.0f;
 
 // Reference adjust step
-const float TREF_STEP_C = 75.5f;
+const float TREF_STEP_C = 0.5f;
 
 // ---------------- Logging ----------------
 const char* DATA_FILE = "/data.csv";
